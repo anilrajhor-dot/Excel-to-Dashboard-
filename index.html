@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>InstantDash v5.0 — Excel to Dashboard</title>
+<title>InstantDash v6.0 — Excel to Dashboard</title>
 
 <!-- ============================================================
      LIBRARIES (loaded from CDN, no build step required)
@@ -12,6 +12,7 @@
      ============================================================ -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -282,7 +283,7 @@ details.panel[open] > summary::before{transform:rotate(90deg)}
     <div class="brand-copy">
       <div class="brand-title-row">
         <h1 id="appName">InstantDash</h1>
-        <span class="version-badge" aria-label="Application version">v5.0</span>
+        <span class="version-badge" aria-label="Application version">v6.0</span>
       </div>
       <span class="sub">Excel to Dashboard</span>
       <span class="developer-credit">Developed by Anil Sharma, Former General Manager, Central Bank of India</span>
@@ -313,8 +314,8 @@ details.panel[open] > summary::before{transform:rotate(90deg)}
       <h2>Drop a spreadsheet to build a dashboard</h2>
       <p>Any columns, any structure. InstantDash reads the file, works out what each column is, and charts it.</p>
       <button class="btn primary" id="browseBtn">Choose a file</button>
-      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" hidden />
-      <div class="formats">.xlsx · .xls · .csv &nbsp;·&nbsp; up to ~100,000 rows &nbsp;·&nbsp; nothing is uploaded anywhere</div>
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.pdf" hidden />
+      <div class="formats">.xlsx · .xls · .csv · .pdf &nbsp;·&nbsp; up to ~100,000 rows &nbsp;·&nbsp; nothing is uploaded anywhere</div>
     </div>
   </section>
 
@@ -413,6 +414,7 @@ details.panel[open] > summary::before{transform:rotate(90deg)}
         <div class="spacer"></div>
         <button class="btn sm no-print" id="copyInsightsBtn">Copy summary</button>
         <button class="btn sm no-print" id="printBtn">Print / Save as PDF</button>
+        <button class="btn sm primary no-print" id="shareBtn">Share dashboard</button>
       </div>
       <div class="card"><pre class="insight-box" id="insightBox"></pre></div>
     </div>
@@ -670,10 +672,88 @@ function wireIngest(){
   $('newFileBtn').onclick = () => input.click();
 }
 
+async function handlePdfFile(file){
+  showLoader('Reading ' + (file.name || 'PDF'), 'Extracting text locally — nothing is being uploaded.');
+  await nextFrame();
+
+  try {
+    if (typeof pdfjsLib === 'undefined') throw new Error('The PDF reader library could not be loaded. Check your internet connection and try again.');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({data: new Uint8Array(buf)}).promise;
+    const aoa = [];
+
+    for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++){
+      showLoader('Reading PDF page ' + pageNo + ' of ' + pdf.numPages, 'Extracting table-like text locally…');
+      const page = await pdf.getPage(pageNo);
+      const content = await page.getTextContent();
+      const items = (content.items || []).filter(it => String(it.str || '').trim());
+
+      // Group PDF text items into visual lines using their Y position.
+      const lines = [];
+      items.forEach(it => {
+        const x = Number(it.transform && it.transform[4] || 0);
+        const y = Number(it.transform && it.transform[5] || 0);
+        let line = lines.find(l => Math.abs(l.y - y) <= 3);
+        if (!line){ line = {y, items:[]}; lines.push(line); }
+        line.items.push({x, text:String(it.str || '').trim()});
+      });
+
+      lines.sort((a,b) => b.y - a.y);
+      lines.forEach(line => {
+        line.items.sort((a,b) => a.x - b.x);
+        const cells = [];
+        let current = '';
+        let lastRight = null;
+        line.items.forEach(it => {
+          const gap = lastRight == null ? 0 : it.x - lastRight;
+          if (current && gap > 18){
+            cells.push(current.trim());
+            current = it.text;
+          } else {
+            current += (current ? ' ' : '') + it.text;
+          }
+          lastRight = it.x + Math.max(4, it.text.length * 4);
+        });
+        if (current.trim()) cells.push(current.trim());
+        if (cells.length) aoa.push(cells);
+      });
+
+      // Keep page boundaries from merging visually unrelated content.
+      if (pageNo < pdf.numPages) aoa.push([]);
+    }
+
+    while (aoa.length && !(aoa[aoa.length-1] || []).some(c => !isBlank(c))) aoa.pop();
+    const nonBlank = aoa.filter(r => (r || []).some(c => !isBlank(c)));
+    if (!nonBlank.length) throw new Error('No selectable text was found in this PDF. Scanned/image-only PDFs are not supported yet.');
+
+    // Feed extracted PDF rows through the existing InstantDash pipeline.
+    APP.workbook = null;
+    APP.fileName = file.name || 'document.pdf';
+    APP.sheetNames = ['PDF'];
+    APP.activeSheet = 'PDF';
+    APP.aoa = aoa;
+    APP.headerRow = detectHeaderRow(aoa);
+    $('headerRow').value = APP.headerRow + 1;
+    $('sheetSelect').innerHTML = '<option selected>PDF</option>';
+    $('sheetSelect').parentElement.style.display = 'none';
+    await rebuildFromAoa();
+  } catch (err){
+    console.error(err);
+    hideLoader();
+    showFatal('That PDF couldn’t be read. ' + (err && err.message ? err.message : 'It may be scanned, protected or contain no selectable text.'));
+  }
+}
+
 async function handleFile(file){
   const name = file.name || 'workbook';
-  if (!/\.(xlsx|xlsm|xls|csv|txt)$/i.test(name)){
-    return showFatal('That file type isn’t supported. Choose an .xlsx, .xls or .csv file.');
+  if (!/\.(xlsx|xlsm|xls|csv|txt|pdf)$/i.test(name)){
+    return showFatal('That file type isn’t supported. Choose an .xlsx, .xls, .csv or .pdf file.');
+  }
+
+  if (/\.pdf$/i.test(name)){
+    return handlePdfFile(file);
   }
   showLoader('Reading ' + name, 'Nothing is being uploaded — this is happening on your machine.');
   await nextFrame();
@@ -2236,6 +2316,27 @@ function wireRest(){
   $('nextPage').onclick = () => { APP.page++; renderTable(); };
   $('exportCsvBtn').onclick = exportCSV;
   $('printBtn').onclick = () => { document.querySelectorAll('details.panel').forEach(d => d.open = true); setTimeout(() => window.print(), 120); };
+  $('shareBtn').onclick = async () => {
+    const title = CONFIG.APP_NAME + ' Dashboard';
+    const summary = $('insightBox').textContent || '';
+    const shareData = { title, text: summary || 'Dashboard created with ' + CONFIG.APP_NAME };
+    try {
+      if (navigator.share) {
+        await navigator.share(shareData);
+        toast('Dashboard shared');
+      } else if (navigator.clipboard) {
+        await navigator.clipboard.writeText(summary || title);
+        toast('Dashboard summary copied');
+      } else {
+        const ta = document.createElement('textarea'); ta.value = summary || title;
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+        toast('Dashboard summary copied');
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      toast('Sharing was not available');
+    }
+  };
   $('copyInsightsBtn').onclick = async () => {
     const text = $('insightBox').textContent;
     try { await navigator.clipboard.writeText(text); toast('Summary copied'); }
