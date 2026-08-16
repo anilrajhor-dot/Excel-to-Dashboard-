@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>InstantDash v7.1 — Excel to Dashboard</title>
+<title>InstantDash v7.2 — Excel to Dashboard</title>
 
 <!-- ============================================================
      LIBRARIES (loaded from CDN, no build step required)
@@ -285,7 +285,7 @@ details.panel[open] > summary::before{transform:rotate(90deg)}
     <div class="brand-copy">
       <div class="brand-title-row">
         <h1 id="appName">InstantDash</h1>
-        <span class="version-badge" aria-label="Application version">v7.1</span>
+        <span class="version-badge" aria-label="Application version">v7.2</span>
       </div>
       <span class="sub">Excel to Dashboard</span>
       <span class="developer-credit">Developed by Anil Sharma, Former General Manager, Central Bank of India</span>
@@ -457,7 +457,7 @@ details.panel[open] > summary::before{transform:rotate(90deg)}
    --------------------------------------------------------------------- */
 const CONFIG = {
   APP_NAME: 'InstantDash',
-  VERSION: '7.1',
+  VERSION: '7.2',
 
   // How many charts to auto-generate
   MIN_CHARTS: 4,
@@ -2318,50 +2318,39 @@ function wireRest(){
   $('nextPage').onclick = () => { APP.page++; renderTable(); };
   $('exportCsvBtn').onclick = exportCSV;
   $('printBtn').onclick = () => { document.querySelectorAll('details.panel').forEach(d => d.open = true); setTimeout(() => window.print(), 120); };
-  // Share the ENTIRE dashboard, not just the text summary.
-  // The dashboard is rendered to a multi-page PDF first; on supported phones
-  // the PDF is then passed to the native Share Sheet.
+  // Share the ENTIRE dashboard.
+  // Important: capture section-by-section rather than one giant canvas.
+  // This avoids iPhone/iPad canvas-size and memory limits on long dashboards.
   $('shareBtn').onclick = async () => {
     const shareBtn = $('shareBtn');
     const originalText = shareBtn.textContent;
     const app = $('app');
     if (!app || app.hidden) return;
 
+    const details = [...document.querySelectorAll('details.panel')];
+    const previousOpen = details.map(d => d.open);
+    const noPrint = [...document.querySelectorAll('.no-print')];
+    const previousDisplay = noPrint.map(n => n.style.display);
+
     try {
       shareBtn.disabled = true;
-      shareBtn.textContent = 'Preparing dashboard…';
-      showLoader('Preparing complete dashboard…', 'Capturing KPIs, charts, pivot table, raw data and summary.');
+      shareBtn.textContent = 'Preparing…';
+      showLoader('Preparing complete dashboard…', 'Capturing each dashboard section safely for iPhone sharing.');
 
-      // Open collapsible sections so the shared dashboard really contains them.
-      const details = [...document.querySelectorAll('details.panel')];
-      const previousOpen = details.map(d => d.open);
       details.forEach(d => d.open = true);
+      // Keep the shared copy clean: remove buttons, filters and pagination controls.
+      noPrint.forEach(n => n.style.display = 'none');
 
-      // Give charts/tables a frame to finish rendering.
       await nextFrame();
-      await new Promise(r => setTimeout(r, 250));
+      await new Promise(r => setTimeout(r, 300));
 
       if (typeof html2canvas === 'undefined' || !window.jspdf || !window.jspdf.jsPDF) {
-        throw new Error('The dashboard sharing libraries could not be loaded. Connect to the internet once and reload the app.');
+        throw new Error('Dashboard sharing libraries are unavailable.');
       }
-
-      const canvas = await html2canvas(app, {
-        backgroundColor: getComputedStyle(document.body).getPropertyValue('--bg').trim() || '#fff',
-        scale: Math.min(2, Math.max(1, window.devicePixelRatio || 1)),
-        useCORS: true,
-        allowTaint: true,
-        logging: false,
-        windowWidth: Math.max(document.documentElement.clientWidth, app.scrollWidth),
-        scrollX: 0,
-        scrollY: -window.scrollY
-      });
-
-      // Restore the user's original open/closed state.
-      details.forEach((d, i) => d.open = previousOpen[i]);
 
       const { jsPDF } = window.jspdf;
       const pdf = new jsPDF({
-        orientation: canvas.width >= canvas.height ? 'landscape' : 'portrait',
+        orientation: 'portrait',
         unit: 'mm',
         format: 'a4',
         compress: true
@@ -2372,37 +2361,85 @@ function wireRest(){
       const margin = 7;
       const usableW = pageW - margin * 2;
       const usableH = pageH - margin * 2;
+      let firstPage = true;
 
-      // Slice the tall dashboard canvas into A4 pages without losing content.
-      const pxPerMm = canvas.width / usableW;
-      const pageCanvasHeight = Math.max(1, Math.floor(usableH * pxPerMm));
-      let y = 0;
-      let pageNo = 0;
+      // Capture the visible dashboard sections individually.
+      const sections = [...app.querySelectorAll(':scope > .section')];
 
-      while (y < canvas.height) {
-        const sliceH = Math.min(pageCanvasHeight, canvas.height - y);
-        const pageCanvas = document.createElement('canvas');
-        pageCanvas.width = canvas.width;
-        pageCanvas.height = sliceH;
-        const pctx = pageCanvas.getContext('2d');
-        pctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--card').trim() || '#fff';
-        pctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
-        pctx.drawImage(canvas, 0, y, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+      for (let i = 0; i < sections.length; i++) {
+        const section = sections[i];
+        if (!section || section.offsetParent === null) continue;
 
-        if (pageNo > 0) pdf.addPage();
-        const imgH = sliceH / pxPerMm;
-        pdf.addImage(pageCanvas.toDataURL('image/jpeg', 0.92), 'JPEG', margin, margin, usableW, imgH);
-        pageNo++;
-        y += sliceH;
+        showLoader('Preparing complete dashboard…',
+          'Capturing section ' + (i + 1) + ' of ' + sections.length + '…');
+
+        const canvas = await html2canvas(section, {
+          backgroundColor: getComputedStyle(document.body).getPropertyValue('--bg').trim() || '#fff',
+          scale: Math.min(1.5, Math.max(1, window.devicePixelRatio || 1)),
+          useCORS: true,
+          allowTaint: true,
+          logging: false,
+          scrollX: 0,
+          scrollY: 0
+        });
+
+        if (!canvas.width || !canvas.height) continue;
+
+        // Fit this section to the A4 page width. If it is taller than one page,
+        // slice ONLY this section into A4-sized pieces.
+        const pxPerMm = canvas.width / usableW;
+        const maxSlicePx = Math.max(1, Math.floor(usableH * pxPerMm));
+        let y = 0;
+
+        while (y < canvas.height) {
+          const sliceH = Math.min(maxSlicePx, canvas.height - y);
+          const slice = document.createElement('canvas');
+          slice.width = canvas.width;
+          slice.height = sliceH;
+
+          const ctx = slice.getContext('2d');
+          ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg').trim() || '#fff';
+          ctx.fillRect(0, 0, slice.width, slice.height);
+          ctx.drawImage(canvas, 0, y, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+
+          if (!firstPage) pdf.addPage();
+          firstPage = false;
+
+          const imgH = sliceH / pxPerMm;
+          pdf.addImage(
+            slice.toDataURL('image/jpeg', 0.88),
+            'JPEG',
+            margin,
+            margin,
+            usableW,
+            Math.min(imgH, usableH)
+          );
+
+          y += sliceH;
+        }
+
+        // Release the section canvas before moving to the next section.
+        canvas.width = 1;
+        canvas.height = 1;
       }
 
-      const safeName = (APP.fileName || 'dashboard').replace(/\.[^.]+$/, '').replace(/[^\w\-]+/g, '_');
+      if (firstPage) throw new Error('No dashboard content was available to capture.');
+
+      const safeName = (APP.fileName || 'dashboard')
+        .replace(/\.[^.]+$/, '')
+        .replace(/[^\w\-]+/g, '_');
+
       const pdfBlob = pdf.output('blob');
-      const pdfFile = new File([pdfBlob], safeName + '-dashboard.pdf', {type:'application/pdf'});
+      const pdfFile = new File(
+        [pdfBlob],
+        safeName + '-complete-dashboard.pdf',
+        {type:'application/pdf'}
+      );
+
       const title = CONFIG.APP_NAME + ' — Complete Dashboard';
 
-      // Native Share Sheet with the complete PDF.
-      if (navigator.share && (!navigator.canShare || navigator.canShare({files:[pdfFile]}))) {
+      if (navigator.share &&
+          (!navigator.canShare || navigator.canShare({files:[pdfFile]}))) {
         await navigator.share({
           title,
           text: 'Complete dashboard: ' + (APP.fileName || ''),
@@ -2410,28 +2447,33 @@ function wireRest(){
         });
         toast('Complete dashboard shared');
       } else {
-        // Fallback: download the complete dashboard PDF.
         const url = URL.createObjectURL(pdfBlob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = safeName + '-dashboard.pdf';
+        a.download = safeName + '-complete-dashboard.pdf';
         document.body.appendChild(a);
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 3000);
         toast('Complete dashboard PDF created');
       }
+
     } catch (err) {
-      console.error(err);
+      console.error('Complete dashboard sharing failed:', err);
       if (!(err && err.name === 'AbortError')) {
         toast('Could not create the complete dashboard');
       }
     } finally {
+      // Always restore the dashboard exactly as the user had it.
+      details.forEach((d, i) => d.open = previousOpen[i]);
+      noPrint.forEach((n, i) => n.style.display = previousDisplay[i]);
+
       hideLoader();
       shareBtn.disabled = false;
       shareBtn.textContent = originalText;
     }
   };
+
   $('copyInsightsBtn').onclick = async () => {
     const text = $('insightBox').textContent;
     try { await navigator.clipboard.writeText(text); toast('Summary copied'); }
